@@ -352,7 +352,7 @@ def try_show_logo(width=72):
 def draw_start_view():
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
     try_show_logo(width=72)
-    st.markdown("<div style='display:inline-block;vertical-align:middle;margin-left:12px'><h1>JD Whisperer</h1><p>Decode job descriptions/call & chat summary into clear candidate insights — skills, gaps, match score & follow-ups.</p></div>", unsafe_allow_html=True)
+    st.markdown("<div style='display:inline-block;vertical-align:middle;margin-left:12px'><h1>JD Whisperer</h1><p>Decode job descriptions/Calls & chat summary into clear candidate insights — skills, gaps, match score & follow-ups.</p></div>", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
     st.write("")
     _, center_col, _ = st.columns([1,1,1])
