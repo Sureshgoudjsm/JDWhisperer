@@ -1,88 +1,64 @@
+# app.py
 import os
+import io
 import json
 import csv
-import io
 import re
 import shutil
-import pandas as pd
 import datetime
 from dotenv import load_dotenv
-import google.generativeai as genai
+
+import pandas as pd
 import streamlit as st
 
-# --- New Libraries for File Parsing ---
+# Optional libs used in your original app (may be missing in environment)
 try:
-    from pypdf import PdfReader
-    from docx import Document
-except ImportError:
-    st.error("Please install missing libraries: pip install pypdf python-docx")
-    st.stop()
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except Exception:
+    GENAI_AVAILABLE = False
 
-# Optional Google Sheets libs
 try:
     import gspread
     from google.oauth2.service_account import Credentials
     HAS_GSHEETS_LIBS = True
-except ImportError:
+except Exception:
     HAS_GSHEETS_LIBS = False
 
-# ------------------------------
-#  PAGE CONFIG (brand)
-# ------------------------------
-st.set_page_config(
-    page_title="JD Whisperer",
-    layout="wide",
-    page_icon="🤫"
-)
+# ----------------------------------------
+# PAGE / BRAND CONFIG
+# ----------------------------------------
+st.set_page_config(page_title="JD Whisperer", layout="wide", page_icon="🤫")
 
-# ------------------------------
-#  LOGO HANDLING
-# ------------------------------
-ORIG_UPLOADED_PATH = '/mnt/data/A_logo_in_digital_vector_art_format_for_"JD_Whispe.png'
-CLEAN_LOCAL_LOGO = 'jd_whisperer_logo.png'
-LOCAL_LOGO_PATH = CLEAN_LOCAL_LOGO
-# Fallback URL
-DRIVE_FILE_ID = "1DJoP8qI8X5mgFnuB3eQueC_WbX7_AT5n"
-LOGO_URL = f"https://drive.google.com/uc?export=view&id={DRIVE_FILE_ID}"
+# ----------- Logo paths -----------
+# Primary: local project asset (recommended)
+LOCAL_ASSET_LOGO = os.path.join("assets", "logo.png")
 
-# ------------------------------
-#  ENV + AI CONFIG
-# ------------------------------
+# Secondary fallback: previously uploaded path on some hosts
+FALLBACK_UPLOADED_LOGO = "/mnt/data/jd_whisperer_logo.png"
+
+# ----------------------------------------
+# ENV & AI CONFIG
+# ----------------------------------------
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", None)
-if not API_KEY:
-    st.error("CRITICAL: GOOGLE_API_KEY not set. Add to env or Streamlit Secrets.")
-    st.stop()
 
-genai.configure(api_key=API_KEY)
+if not API_KEY and GENAI_AVAILABLE:
+    st.warning("GOOGLE_API_KEY not found. AI calls will fail until you set the key in env or Streamlit secrets.")
+
+if GENAI_AVAILABLE and API_KEY:
+    genai.configure(api_key=API_KEY)
 
 @st.cache_resource
 def get_model():
-    return genai.GenerativeModel('gemini-2.5-flash')
+    """Cached model accessor (if genai is installed)."""
+    if not GENAI_AVAILABLE:
+        return None
+    return genai.GenerativeModel("gemini-2.5-flash")
 
-# ------------------------------
-#  FILE PARSING
-# ------------------------------
-def extract_text_from_pdf(file):
-    try:
-        reader = PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        return text
-    except Exception as e:
-        return f"Error reading PDF: {e}"
-
-def extract_text_from_docx(file):
-    try:
-        doc = Document(file)
-        return "\n".join([para.text for para in doc.paragraphs])
-    except Exception as e:
-        return f"Error reading DOCX: {e}"
-
-# ------------------------------
-#  GOOGLE SHEETS
-# ------------------------------
+# ----------------------------------------
+# GOOGLE SHEETS (optional)
+# ----------------------------------------
 FIELD_ORDER = [
     "date_contacted","hr_name","phone_number","email_id","role_position",
     "recruiter_company","client_company","location","job_type","mode_of_contact",
@@ -92,6 +68,10 @@ FIELD_ORDER = [
 ]
 
 def _get_gsheets_creds_and_id():
+    """
+    Reads GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT from Streamlit secrets.
+    Returns (creds_dict, sheet_id) or (None, None).
+    """
     try:
         sheet_id = st.secrets.get("GOOGLE_SHEET_ID", None)
         sa_info = st.secrets.get("GOOGLE_SERVICE_ACCOUNT", None)
@@ -107,6 +87,7 @@ def _get_gsheets_creds_and_id():
 
 @st.cache_resource
 def get_gsheets_worksheet():
+    """Return a gspread worksheet object if configured, else None."""
     if not HAS_GSHEETS_LIBS:
         return None
     creds_dict, sheet_id = _get_gsheets_creds_and_id()
@@ -117,9 +98,10 @@ def get_gsheets_worksheet():
     client = gspread.authorize(creds)
     sh = client.open_by_key(sheet_id)
     ws = sh.sheet1
+    # ensure header row
     try:
-        existing_values = ws.get_all_values()
-        if not existing_values:
+        vals = ws.get_all_values()
+        if not vals:
             headers = ["timestamp_utc"] + FIELD_ORDER
             ws.append_row(headers, value_input_option="USER_ENTERED")
     except Exception:
@@ -127,17 +109,19 @@ def get_gsheets_worksheet():
     return ws
 
 def save_history_to_gsheets(result: dict):
+    """Append a row to Google Sheets if configured (silently skip on error)."""
     try:
         ws = get_gsheets_worksheet()
         if ws is None:
             return
-        timestamp = datetime.datetime.utcnow().isoformat()
-        row = [timestamp] + [result.get(k, "") for k in FIELD_ORDER]
+        ts = datetime.datetime.utcnow().isoformat()
+        row = [ts] + [result.get(k, "") for k in FIELD_ORDER]
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         st.warning(f"Could not save to Google Sheets: {e}")
 
 def load_history_dataframe() -> pd.DataFrame:
+    """Load history from Google Sheets (preferred) or from session history fallback."""
     df = None
     try:
         ws = get_gsheets_worksheet()
@@ -156,105 +140,69 @@ def load_history_dataframe() -> pd.DataFrame:
         df = pd.DataFrame()
     return df
 
-# ------------------------------
-#  SESSION STATE & RESET LOGIC
-# ------------------------------
-def init_state():
-    if 'app_state' not in st.session_state:
-        st.session_state.app_state = {
-            'current_view': 'start',
-            'profile_data': "",
-            'job_description': "",
-            'skills_data': "",
-            'analysis_result': None,
-            'generated_email': "" # New feature state
-        }
-    if 'history' not in st.session_state:
-        st.session_state['history'] = []
-    if 'mode' not in st.session_state:
-        st.session_state['mode'] = 'Analyze'
-
-def soft_reset():
-    """Keeps Profile, clears JD and Results."""
-    st.session_state.app_state['current_view'] = 'map'
-    # Note: We deliberately DO NOT clear 'profile_data'
-    st.session_state.app_state['job_description'] = ""
-    st.session_state.app_state['skills_data'] = ""
-    st.session_state.app_state['analysis_result'] = None
-    st.session_state.app_state['generated_email'] = ""
-
-def hard_reset():
-    """Clears EVERYTHING."""
+# ----------------------------------------
+# SESSION STATE (clear comments / locations)
+# ----------------------------------------
+def reset_app_state():
+    """
+    Reset core app_state in session_state.
+    - current_view: 'start' / 'map' / 'results'
+    - profile_data, job_description, skills_data: user inputs
+    - analysis_result: AI output (dict)
+    """
     st.session_state.app_state = {
-        'current_view': 'start',
-        'profile_data': "",
-        'job_description': "",
-        'skills_data': "",
-        'analysis_result': None,
-        'generated_email': ""
+        "current_view": "start",
+        "profile_data": "",
+        "job_description": "",
+        "skills_data": "",
+        "analysis_result": None
     }
 
-init_state()
+# initialize session keys with comments so you can find them quickly later
+if "app_state" not in st.session_state:
+    reset_app_state()   # <-- core app flow state
 
-# ------------------------------
-#  AI PROMPTS
-# ------------------------------
+if "history" not in st.session_state:
+    st.session_state.history = []   # <-- in-session run history (temporary)
+
+if "mode" not in st.session_state:
+    st.session_state.mode = "Analyze"  # <-- UI mode (Analyze / History)
+
+# ----------------------------------------
+# AI PROMPT + processing helpers
+# ----------------------------------------
 EXTRACTION_PROMPT = """
 You are an expert data extraction assistant for job seekers. Your task is to analyze the provided texts:
-1) Job Details (JD, email, call notes) and
-2) Applicant Skills (Resume/Summary).
+1) Job Details (JD, email, call notes)
+2) Applicant Skills (Resume/Summary)
 
-You MUST:
-- Infer as many fields as possible from context.
-- Use "Not specified" if you truly cannot infer a value.
+You MUST return a single valid JSON object (no text outside JSON). Use "Not specified" when unknown.
 
-CRITICAL: Return a single, valid JSON object only.
+Ensure:
+- interview_scheduled_date: YYYY-MM-DD format if present
+- skill_gap_analysis: VERY SHORT (2-3 sentences max)
+- prep_hint: 1-2 short sentences
 
-FIELD-SPECIFIC RULES:
-- "interview_scheduled_date" as "YYYY-MM-DD"
-- "skill_gap_analysis": VERY SHORT (2-3 sentences max)
-- "prep_hint": 1-2 short sentences
-
-JSON Keys (all must be present):
+Return keys (all must be present):
 """ + ", ".join(FIELD_ORDER + ["match_score","skill_gap_analysis","prep_hint"]) + """
 
 Input:
 ***
 {text_input}
 ***
-Return ONLY the JSON object.
 """
 
-EMAIL_PROMPT = """
-You are a top-tier career coach. Write a short, punchy, professional "Cold Email" or "Cover Letter" for the candidate to send to the recruiter.
-
-Context:
-- Candidate Profile: {profile}
-- Job Role: {role}
-- Company: {company}
-- Recruiter Name: {recruiter} (If unknown, use "Hiring Manager")
-- Key Matching Skills: {keywords}
-
-Instructions:
-- Tone: Professional, confident, but not arrogant.
-- Length: Under 150 words.
-- Structure: Hook -> Value Prop -> Call to Action.
-- Do not include placeholders like [Your Name] if you can infer it from the profile.
-
-Output: Just the email body text.
-"""
-
-# ------------------------------
-#  HELPERS
-# ------------------------------
 def safe_json_from_response(text: str) -> dict:
-    cleaned = text.strip().replace('```json', '').replace('```', '')
-    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if not match:
-        return json.loads(cleaned)
-    return json.loads(match.group(0))
+    """Extract JSON object from model response text robustly."""
+    cleaned = (text or "").strip().replace("```json", "").replace("```", "")
+    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if m:
+        return json.loads(m.group(0))
+    # try naive load
+    return json.loads(cleaned)
 
 def keep_first_sentences(text: str, max_sentences: int = 3) -> str:
+    """Keep only the first `max_sentences` sentences (used for prep/gap brevity)."""
     if not isinstance(text, str):
         return text
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
@@ -264,43 +212,60 @@ def keep_first_sentences(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 def process_recruiter_text(text_to_process: str) -> dict:
+    """
+    Call the model and return parsed JSON. If genai not available, returns a mocked example.
+    """
+    if not GENAI_AVAILABLE or not API_KEY:
+        # Mock response for offline/dev environments
+        return {
+            "date_contacted": "Not specified",
+            "hr_name": "Not specified",
+            "phone_number": "Not specified",
+            "email_id": "Not specified",
+            "role_position": "Python Fullstack Developer",
+            "recruiter_company": "Not specified",
+            "client_company": "Not specified",
+            "location": "Not specified",
+            "job_type": "Not specified",
+            "mode_of_contact": "Not specified",
+            "interview_mode": "Not specified",
+            "interview_scheduled_date": "Not specified",
+            "round_1_details": "Not specified",
+            "round_2_details": "Not specified",
+            "ctc_offered_expected": "Not specified",
+            "status": "Not specified",
+            "next_follow_up_date": "Not specified",
+            "review_notes": "Not specified",
+            "extracted_keywords": "Python, AWS, SQL",
+            "match_score": "85",
+            "skill_gap_analysis": "Lacks advanced cloud infra examples; add Azure/AWS deployment samples.",
+            "prep_hint": "Prepare concise examples of cloud infra and fullstack projects."
+        }
+
     model = get_model()
     prompt_with_input = EXTRACTION_PROMPT.format(text_input=text_to_process)
     try:
         response = model.generate_content(prompt_with_input)
-        raw_text = response.text or ""
-        parsed = safe_json_from_response(raw_text)
-        for key in ("skill_gap_analysis", "prep_hint"):
-            if key in parsed and isinstance(parsed[key], str):
-                parsed[key] = keep_first_sentences(parsed[key], 3)
+        parsed = safe_json_from_response(response.text)
+        # ensure brevity on two fields
+        for k in ("skill_gap_analysis", "prep_hint"):
+            if k in parsed and isinstance(parsed[k], str):
+                parsed[k] = keep_first_sentences(parsed[k], max_sentences=3)
+        # ensure all keys exist
+        for key in FIELD_ORDER + ["match_score", "skill_gap_analysis", "prep_hint"]:
+            if key not in parsed:
+                parsed[key] = "Not specified"
         return parsed
     except json.JSONDecodeError:
-        return {"error": f"Invalid JSON returned. Raw: {response.text if 'response' in locals() else 'N/A'}"}
+        return {"error": f"AI returned invalid JSON. Raw: {response.text if 'response' in locals() else 'N/A'}"}
     except Exception as e:
-        return {"error": f"Error: {e}"}
+        return {"error": str(e)}
 
-def generate_email_logic():
-    res = st.session_state.app_state['analysis_result']
-    profile = st.session_state.app_state['profile_data']
-    
-    if not res or not profile: return "Error: Missing data."
-
-    prompt = EMAIL_PROMPT.format(
-        profile=profile[:3000], # Limit context
-        role=res.get('role_position', 'the role'),
-        company=res.get('client_company', 'your company'),
-        recruiter=res.get('hr_name', 'Hiring Manager'),
-        keywords=res.get('extracted_keywords', 'my skills')
-    )
-    
-    model = get_model()
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Could not generate email: {e}"
-
+# ----------------------------------------
+# Utility helpers
+# ----------------------------------------
 def create_ics_file(details: dict) -> str:
+    """Creates an .ics calendar string if interview_scheduled_date present (YYYY-MM-DD)."""
     date_str = details.get("interview_scheduled_date")
     if not date_str or date_str == "Not specified":
         return ""
@@ -308,9 +273,9 @@ def create_ics_file(details: dict) -> str:
         start_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(hour=10, minute=0)
         end_date = start_date + datetime.timedelta(hours=1)
         dt_format = "%Y%m%dT%H%M%S"
-        summary = f"Interview: {details.get('role_position', 'Job')} @ {details.get('client_company', 'Client')}"
+        summary = f"Interview: {details.get('role_position','Job')} @ {details.get('client_company','Client')}"
         description = f"Role: {details.get('role_position','N/A')}\\nCompany: {details.get('client_company','N/A')}\\nNotes: {details.get('review_notes','')}"
-        ics_content = (
+        ics = (
             "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//JD Whisperer//EN\nBEGIN:VEVENT\n"
             f"UID:{datetime.datetime.now().strftime(dt_format)}-{hash(summary)}\n"
             f"DTSTAMP:{datetime.datetime.now().strftime(dt_format)}\n"
@@ -318,367 +283,310 @@ def create_ics_file(details: dict) -> str:
             f"DTEND:{end_date.strftime(dt_format)}\n"
             f"SUMMARY:{summary}\nDESCRIPTION:{description}\nEND:VEVENT\nEND:VCALENDAR"
         )
-        return ics_content
+        return ics
     except Exception:
         return ""
 
 def sanitize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert complex column types to JSON strings so Streamlit/pyarrow can render them."""
     df = df.copy()
     for col in df.columns:
         if df[col].map(lambda x: isinstance(x, (dict, list, set, tuple))).any():
             df[col] = df[col].map(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list, set, tuple)) else x)
     return df
 
-# ------------------------------
-#  BRAND CSS
-# ------------------------------
-# ------------------------------
-#  BRAND CSS
-# ------------------------------
+# ----------------------------------------
+# Styling & Logo rendering
+# ----------------------------------------
 def load_brand_css():
-    # NOTE: We removed the 'f' before the string so Python doesn't try to interpret the CSS
     st.markdown("""
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Manrope:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
-    :root {
-        --bg: #0B1E37;
-        --surface: #122642;
-        --muted: #9EACBE;
-        --text: #F5F9FF;
-        --accent-1: #4C8CFF;
-        --accent-2: #6A5CFF;
-        --accent-3: #00D4D0;
+    :root{
+        --bg:#0B1E37; --surface:#122642; --muted:#9EACBE; --text:#F5F9FF;
+        --accent-1:#4C8CFF; --accent-2:#6A5CFF; --accent-3:#00D4D0;
     }
-    body {
-        font-family: 'Inter', 'Manrope', sans-serif;
-        background: var(--bg) !important;
-        color: var(--text) !important;
+    body{background:var(--bg); color:var(--text); font-family:Inter, sans-serif;}
+    .block-container{ padding: 2rem !important; }
+    .main-header h1{
+        font-family:Manrope, sans-serif;
+        font-weight:800;
+        font-size:36px;
+        background:linear-gradient(90deg,var(--accent-1),var(--accent-2),var(--accent-3));
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+        margin:0;
     }
-    .stApp .block-container {
-        padding: 2rem 2rem 3rem 2rem !important;
-        background: linear-gradient(180deg, rgba(11,30,55,0.95) 0%, rgba(17,38,66,0.95) 100%);
-        border-radius: 8px;
+    .main-header p{ color:var(--muted); margin:4px 0 0 0; }
+    .stButton > button{
+        background: linear-gradient(90deg,var(--accent-1),var(--accent-2)) !important;
+        color: white !important; border-radius:8px !important; font-weight:700 !important;
     }
-    .main-header {
-        text-align: left;
-        padding: 1rem 0;
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-    }
-    .main-header img.logo {
-        height: 56px;
-    }
-    .main-header h1 {
-        margin: 0;
-        font-family: 'Manrope', sans-serif;
-        font-weight: 800;
-        font-size: 34px;
-        color: var(--text);
-        letter-spacing: -0.02em;
-        background: linear-gradient(90deg, var(--accent-1), var(--accent-2), var(--accent-3));
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .main-header p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 14px;
-    }
-    .mind-map-card {
-        background: linear-gradient(180deg, rgba(22,38,60,0.6), rgba(17,30,45,0.45));
-        border: 1px solid rgba(76,140,255,0.12);
-        border-radius: 12px;
-        padding: 18px;
-        text-align: center;
-        min-height: 250px;
-    }
-    .stButton > button {
-        background: linear-gradient(90deg, var(--accent-1), var(--accent-2)) !important;
-        color: white !important;
-        border-radius: 8px !important;
-        padding: 10px 14px !important;
-        font-weight: 700 !important;
-        border: none !important;
-    }
-    .stButton > button:hover {
-        filter: brightness(1.03);
-    }
-    .stMetric > div > div > div {
-        color: var(--accent-3) !important;
-    }
-    .whisper-divider {
-        height: 6px;
-        border-radius: 6px;
-        background: linear-gradient(90deg, var(--accent-1), var(--accent-2), var(--accent-3));
-        margin: 16px 0;
-    }
-    /* Start Screen specific centering */
-    .start-container {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        min-height: 60vh;
-        text-align: center;
-        gap: 1rem;
-    }
+    .whisper-divider{ height:6px; border-radius:8px; background: linear-gradient(90deg,var(--accent-1),var(--accent-2),var(--accent-3)); margin:16px 0; }
+    .mind-map-card{ background: linear-gradient(180deg, rgba(22,38,60,0.55), rgba(17,30,45,0.35)); padding:16px; border-radius:12px; border:1px solid rgba(76,140,255,0.08); }
     </style>
     """, unsafe_allow_html=True)
 
-# ------------------------------
-#  UI VIEWS
-# ------------------------------
 def try_show_logo(width=72):
-    if os.path.exists(LOCAL_LOGO_PATH):
+    """
+    Try local asset first (assets/logo.png). If not found, try fallback uploaded path.
+    This is the recommended method for bundling logos in your repo (assets folder).
+    """
+    if os.path.exists(LOCAL_ASSET_LOGO):
         try:
-            st.image(LOCAL_LOGO_PATH, width=width)
+            st.image(LOCAL_ASSET_LOGO, width=width)
             return
         except Exception:
             pass
-    try:
-        st.image(LOGO_URL, width=width)
-    except Exception:
-        pass
+    if os.path.exists(FALLBACK_UPLOADED_LOGO):
+        try:
+            st.image(FALLBACK_UPLOADED_LOGO, width=width)
+            return
+        except Exception:
+            pass
+    # if nothing available, do nothing (no broken icons)
+    return
 
+# ----------------------------------------
+# UI: Start / Map / Results / History
+# ----------------------------------------
 def draw_start_view():
     st.markdown('<div class="main-header">', unsafe_allow_html=True)
-    try_show_logo(width=50)
+    try_show_logo(width=72)
+    st.markdown("<div style='display:inline-block;vertical-align:middle;margin-left:12px'><h1>JD Whisperer</h1><p>Decode any job description</p></div>", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="start-container">', unsafe_allow_html=True)
-    st.markdown('<h1 style="font-size: 4rem; margin-bottom: 0;">JD Whisperer</h1>', unsafe_allow_html=True)
-    st.markdown('<p style="font-size: 1.2rem; color: #9EACBE; margin-bottom: 2rem;">Intelligently Map Your Next Career Move</p>', unsafe_allow_html=True)
-    
-    _, btn_col, _ = st.columns([5, 2, 5])
-    with btn_col:
-        if st.button("🚀 Start Mapping", use_container_width=True):
-            st.session_state.app_state['current_view'] = 'map'
+    st.write("")
+    _, center_col, _ = st.columns([1,1,1])
+    with center_col:
+        if st.button("🚀 Start Mapping"):
+            st.session_state.app_state["current_view"] = "map"
             st.rerun()
-            
-    st.markdown('</div>', unsafe_allow_html=True)
 
 def draw_map_view():
-    st.markdown('<div style="display:flex;gap:1rem;align-items:center;margin-bottom:1rem">', unsafe_allow_html=True)
-    st.markdown('<h2 style="margin:0;color:var(--text)">Build Your Career Mind Map</h2>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns(3, gap="medium")
-    
-    # --- CARD 1: PROFILE (With Persistence & File Upload) ---
+    st.markdown("<h2>Build Your Career Mind Map</h2>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns(3, gap="large")
     with col1:
-        st.markdown('<div class="mind-map-card"><h3>👤 Your Profile</h3><p>Upload Resume or Paste Text</p></div>', unsafe_allow_html=True)
-        
-        # Show status if data is present
-        if st.session_state.app_state['profile_data']:
-             st.success("✅ Profile Loaded")
-             if st.button("❌ Clear Profile", key="clear_profile"):
-                 st.session_state.app_state['profile_data'] = ""
-                 st.rerun()
-        
-        tab_up, tab_txt = st.tabs(["📂 Upload", "✍️ Paste"])
-        
-        with tab_up:
-            uploaded_file = st.file_uploader("Upload PDF/DOCX", type=['pdf', 'docx'], key="resume_file")
-            if uploaded_file is not None:
-                with st.spinner("Reading file..."):
-                    if uploaded_file.name.endswith('.pdf'):
-                        text = extract_text_from_pdf(uploaded_file)
-                    else:
-                        text = extract_text_from_docx(uploaded_file)
-                    
-                    if text:
-                        st.session_state.app_state['profile_data'] = text
-                        st.success("Resume parsed successfully!")
-                        # We don't rerun immediately to let user see success message, 
-                        # but value is updated in state.
+        st.markdown('<div class="mind-map-card"><h3>Your Profile</h3><p>Paste resume summary or LinkedIn about.</p></div>', unsafe_allow_html=True)
+        profile_text = st.text_area("Your Profile", height=200, key="profile_input", label_visibility="collapsed", placeholder="e.g., 5+ years in Python, AWS, SQL...")
+        st.session_state.app_state['profile_data'] = profile_text
 
-        with tab_txt:
-            val = st.text_area("Paste Text", 
-                             value=st.session_state.app_state['profile_data'], 
-                             height=150, 
-                             key="profile_input_area", 
-                             label_visibility="collapsed", 
-                             placeholder="e.g., 5+ years in Python, AWS...")
-            if val != st.session_state.app_state['profile_data']:
-                st.session_state.app_state['profile_data'] = val
-
-    # --- CARD 2: JD (Clears on Soft Reset) ---
     with col2:
-        st.markdown('<div class="mind-map-card"><h3>📄 Job Description</h3><p>Paste the JD, recruiter email, or call notes.</p></div>', unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        jd_text = st.text_area("Job Description", 
-                             value=st.session_state.app_state['job_description'],
-                             height=230, 
-                             key="jd_input", 
-                             label_visibility="collapsed", 
-                             placeholder="Paste JD here...")
+        st.markdown('<div class="mind-map-card"><h3>Job Description</h3><p>Paste the JD, recruiter email, or call notes.</p></div>', unsafe_allow_html=True)
+        jd_text = st.text_area("Job Description", height=200, key="jd_input", label_visibility="collapsed", placeholder="Paste JD here...")
         st.session_state.app_state['job_description'] = jd_text
 
-    # --- CARD 3: NOTES (Clears on Soft Reset) ---
     with col3:
-        st.markdown('<div class="mind-map-card"><h3>📝 Extra Notes</h3><p>CTC, notice period, call summary.</p></div>', unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        skills_text = st.text_area("Skill Assessment", 
-                                 value=st.session_state.app_state['skills_data'],
-                                 height=230, 
-                                 key="skills_input", 
-                                 label_visibility="collapsed", 
-                                 placeholder="Additional notes...")
+        st.markdown('<div class="mind-map-card"><h3>Extra Notes</h3><p>CTC, notice period, call summary.</p></div>', unsafe_allow_html=True)
+        skills_text = st.text_area("Skill Assessment", height=200, key="skills_input", label_visibility="collapsed", placeholder="Additional notes...")
         st.session_state.app_state['skills_data'] = skills_text
 
     st.markdown('<div class="whisper-divider"></div>', unsafe_allow_html=True)
 
-    has_profile = bool(st.session_state.app_state['profile_data'].strip())
-    has_jd = bool(st.session_state.app_state['job_description'].strip())
-    
-    if not (has_profile and has_jd):
-        st.info("Please provide **Your Profile** and **Job Description** to generate analysis.")
+    is_ready = bool(st.session_state.app_state['profile_data'].strip() and st.session_state.app_state['job_description'].strip())
+    if not is_ready:
+        st.info("Please fill at least Your Profile and Job Description to run the analysis.")
 
-    if st.button("✨ Generate Analysis", disabled=not (has_profile and has_jd), use_container_width=True):
-        combined_text = (
+    if st.button("✨ Generate Analysis", disabled=not is_ready):
+        combined = (
             f"--- APPLICANT SKILLS ---\n{st.session_state.app_state['profile_data']}\n\n"
             f"--- JOB DETAILS ---\n{st.session_state.app_state['job_description']}\n\n"
             f"--- ADDITIONAL NOTES ---\n{st.session_state.app_state['skills_data']}"
         )
         with st.spinner("🧠 JD Whisperer is analyzing..."):
-            result = process_recruiter_text(combined_text)
+            result = process_recruiter_text(combined)
             st.session_state.app_state['analysis_result'] = result
             if "error" not in result:
-                st.session_state['history'].append(result)
+                # append to session history and attempt persistence
+                st.session_state.history.append(result)
                 save_history_to_gsheets(result)
             st.session_state.app_state['current_view'] = 'results'
             st.rerun()
 
 def draw_results_view():
-    st.markdown('<div style="display:flex;justify-content:space-between;align-items:center">', unsafe_allow_html=True)
+    st.markdown("<div style='display:flex;justify-content:space-between;align-items:center'>", unsafe_allow_html=True)
     left, right = st.columns([1,4])
     with left:
         try_show_logo(width=64)
     with right:
-        st.markdown('<h2 style="margin:0">Analysis Results</h2>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("<h2>Job Match & Tracker Analysis</h2><p style='color:#9EACBE;margin-top:0'>An at-a-glance analysis of your profile against the recruiter/job details.</p>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     result = st.session_state.app_state.get('analysis_result')
     if not result:
-        st.error("No analysis found.")
-        if st.button("Back"): soft_reset(); st.rerun()
-        return
-    if "error" in result:
-        st.error(result.get("error"))
-        if st.button("Back"): soft_reset(); st.rerun()
+        st.error("No analysis found. Please run an analysis.")
+        if st.button("⬅️ Go Back"):
+            st.session_state.app_state['current_view'] = 'map'
+            st.rerun()
         return
 
-    raw_score = result.get('match_score','N/A')
+    if "error" in result:
+        st.error(result.get("error"))
+        if st.button("⬅️ Go Back"):
+            st.session_state.app_state['current_view'] = 'map'
+            st.rerun()
+        return
+
+    raw_score = result.get('match_score', 'N/A')
     try:
         match_score_display = f"{int(str(raw_score).replace('%','').strip())}%"
     except Exception:
         match_score_display = str(raw_score)
 
-    # TABS for Results View
-    tab_dash, tab_email, tab_data = st.tabs(["📊 Dashboard", "✉️ Email Generator", "💾 Raw Data"])
+    col1, col2 = st.columns([1,2], gap="large")
+    with col1:
+        st.metric("Overall Match Score", match_score_display)
+        st.markdown(f"**Status:** {result.get('status','Not specified')}")
+        st.markdown(f"**Next Follow-up:** {result.get('next_follow_up_date','Not specified')}")
+    with col2:
+        st.subheader("🧩 Summary")
+        st.markdown(f"- **Role:** {result.get('role_position','Not specified')}")
+        st.markdown(f"- **Company:** {result.get('client_company','Not specified')}")
+        st.markdown(f"- **Location:** {result.get('location','Not specified')}")
+        st.markdown(f"- **Mode:** {result.get('mode_of_contact','Not specified')}")
 
-    with tab_dash:
-        col1, col2 = st.columns([1,2], gap="large")
-        with col1:
-            st.metric(label="Match Score", value=match_score_display)
-            st.info(f"**Gap:** {result.get('skill_gap_analysis','-')}")
-            st.success(f"**Hint:** {result.get('prep_hint','-')}")
-        with col2:
-            st.subheader("Summary")
-            st.write(f"**Role:** {result.get('role_position')}")
-            st.write(f"**Company:** {result.get('client_company')}")
-            st.write(f"**Keywords:** {result.get('extracted_keywords')}")
+    st.markdown('<div class="whisper-divider"></div>', unsafe_allow_html=True)
 
-    with tab_email:
-        st.markdown("### ✉️ Instant Cold Email Draft")
-        st.caption("Based on your profile and this specific job description.")
-        
-        if st.button("✨ Draft Email to HR", key="gen_email_btn"):
-            with st.spinner("Writing email..."):
-                email_text = generate_email_logic()
-                st.session_state.app_state['generated_email'] = email_text
-        
-        if st.session_state.app_state['generated_email']:
-            st.text_area("Copy this:", value=st.session_state.app_state['generated_email'], height=300)
-    
-    with tab_data:
-        df_display = pd.DataFrame([result]).T
-        df_display.columns = ["Value"]
-        df_display = sanitize_df_for_streamlit(df_display)
-        st.dataframe(df_display, use_container_width=True)
-        
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=result.keys())
-        writer.writeheader()
-        writer.writerow(result)
-        csv_data = output.getvalue()
-        st.download_button("📄 Download CSV", data=csv_data, file_name="job_details.csv", mime="text/csv")
+    st.subheader("🎯 Prep & Gap")
+    st.markdown(f"**Skill Gap (short):** {result.get('skill_gap_analysis','Not identified.')}")
+    st.markdown(f"**Prep Hint:** {result.get('prep_hint','No hint available.')}")
 
     st.markdown("---")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("⬅️ Edit Inputs (Keep Data)"):
+    cL, cR = st.columns([2,1], gap="large")
+    with cL:
+        st.subheader("📋 Full Extracted Data")
+        df_display = pd.DataFrame([result]).T
+        df_display.columns = ["Extracted Value"]
+        df_display = sanitize_df_for_streamlit(df_display)
+        st.dataframe(df_display, use_container_width=True)
+    with cR:
+        st.subheader("💾 Downloads")
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=result.keys())
+        writer.writeheader()
+        writer.writerow(result)
+        csv_data = buf.getvalue()
+        st.download_button("📄 Download Job Tracker (.csv)", data=csv_data, file_name="job_details.csv", mime="text/csv", use_container_width=True)
+        ics_data = create_ics_file(result)
+        if ics_data:
+            st.download_button("📅 Download Calendar Event (.ics)", data=ics_data, file_name="interview.ics", mime="text/calendar", use_container_width=True)
+        else:
+            st.caption("No valid interview date found to create a calendar event (YYYY-MM-DD expected).")
+
+    st.markdown("---")
+    if st.session_state.get('history'):
+        with st.expander("🧾 View this session's history"):
+            hist_df = pd.DataFrame(st.session_state['history'])
+            hist_df = sanitize_df_for_streamlit(hist_df)
+            st.dataframe(hist_df, use_container_width=True)
+
+    back_col, new_col = st.columns(2)
+    with back_col:
+        if st.button("⬅️ Edit Inputs"):
             st.session_state.app_state['current_view'] = 'map'
             st.rerun()
-    with c2:
-        # Soft Reset: Clears JD/Notes but KEEPS Profile
-        if st.button("🔄 Analyze Next Job (Keep Profile)"):
-            soft_reset()
+    with new_col:
+        if st.button("🔄 Start New Analysis"):
+            reset_app_state()
             st.rerun()
 
 def draw_history_view():
-    st.markdown("## 📊 History Dashboard")
+    st.markdown("<h2>📊 History Dashboard</h2>", unsafe_allow_html=True)
     df = load_history_dataframe()
     if df.empty:
         st.info("No history found yet.")
         return
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    if "timestamp_utc" in df.columns:
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], errors="coerce")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Total Records", len(df))
+    if "role_position" in df.columns:
+        c2.metric("Unique Roles", df["role_position"].fillna("").nunique())
+    else:
+        c2.metric("Unique Roles", "-")
+    if "status" in df.columns:
+        c3.metric("Statuses", df["status"].fillna("").nunique())
+    else:
+        c3.metric("Statuses", "-")
+    st.markdown("---")
+    st.subheader("🔍 Filters")
+    left, right = st.columns([3,1])
+    with left:
+        text_query = st.text_input("Search role / recruiter / client", placeholder="e.g., Python, Accenture")
+    with right:
+        if "status" in df.columns:
+            statuses = sorted([s for s in df["status"].dropna().unique() if s])
+        else:
+            statuses = []
+        status_filter = st.multiselect("Status", options=statuses, default=statuses)
+    date_range = None
+    if "timestamp_utc" in df.columns and df["timestamp_utc"].notna().any():
+        min_d = df["timestamp_utc"].min().date()
+        max_d = df["timestamp_utc"].max().date()
+        date_range = st.slider("Date range", min_value=min_d, max_value=max_d, value=(min_d, max_d))
+    mask = pd.Series(True, index=df.index)
+    if text_query:
+        q = text_query.lower()
+        cols_to_search = []
+        for name in ["role_position","recruiter_company","client_company"]:
+            if name in df.columns:
+                cols_to_search.append(df[name].fillna("").str.lower())
+        if cols_to_search:
+            combined = cols_to_search[0].str.contains(q)
+            for extra in cols_to_search[1:]:
+                combined = combined | extra.str.contains(q)
+            mask &= combined
+    if status_filter and "status" in df.columns:
+        mask &= df["status"].fillna("").isin(status_filter)
+    if date_range and "timestamp_utc" in df.columns:
+        s,e = date_range
+        mask &= (df["timestamp_utc"].dt.date >= s) & (df["timestamp_utc"].dt.date <= e)
+    df_filtered = df[mask].copy()
+    df_filtered = sanitize_df_for_streamlit(df_filtered)
+    st.markdown(f"Showing **{len(df_filtered)}** records")
+    st.markdown("---")
+    st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
-# ------------------------------
-#  MAIN ROUTER
-# ------------------------------
+# ----------------------------------------
+# MAIN APP ROUTER
+# ----------------------------------------
 def main():
     load_brand_css()
-
-    # Sidebar
+    # Sidebar (logo + mode buttons)
     with st.sidebar:
-        st.markdown("<div style='display:flex;align-items:center;gap:8px'>", unsafe_allow_html=True)
+        st.markdown("<div style='display:flex;gap:12px;align-items:center'>", unsafe_allow_html=True)
         try_show_logo(width=48)
-        st.markdown("<div><strong>JD Whisperer</strong><br><small style='color:var(--muted)'>Decode any job description</small></div>", unsafe_allow_html=True)
+        st.markdown("<div><strong>JD Whisperer</strong><br><small style='color:#9EACBE'>Decode any job description</small></div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("#### Mode")
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("Analyze", use_container_width=True, key="mode_analyze_btn"):
-                st.session_state['mode'] = "Analyze"
+                st.session_state.mode = "Analyze"
                 st.rerun()
         with col_b:
             if st.button("History", use_container_width=True, key="mode_history_btn"):
-                st.session_state['mode'] = "History"
+                st.session_state.mode = "History"
                 st.rerun()
-        
+        st.caption(f"Current mode: **{st.session_state.mode}**")
         st.markdown("---")
-        if st.button("🗑️ Hard Reset (Clear All)"):
-            hard_reset()
-            st.rerun()
-        
+        st.markdown("**Steps (Analyze mode):**\n1. Paste profile & JD\n2. Click Generate Analysis\n3. Download CSV / Calendar")
         creds_dict, sheet_id = _get_gsheets_creds_and_id()
         if HAS_GSHEETS_LIBS and creds_dict and sheet_id:
-            st.caption("✅ GSheets Connected")
+            st.success("Google Sheets logging: ON")
+        else:
+            st.info("Google Sheets logging: OFF (configure secrets)")
 
-    mode = st.session_state.get('mode', 'Analyze')
-    if mode == "History":
+    # Mode routing
+    if st.session_state.mode == "History":
         draw_history_view()
         return
 
-    view = st.session_state.app_state.get('current_view','start')
-    if view == 'start':
+    view = st.session_state.app_state.get("current_view", "start")
+    if view == "start":
         draw_start_view()
-    elif view == 'map':
+    elif view == "map":
         draw_map_view()
-    elif view == 'results':
+    elif view == "results":
         draw_results_view()
     else:
         reset_app_state()
