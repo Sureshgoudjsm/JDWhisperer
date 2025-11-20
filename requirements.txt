@@ -1,5 +1,8 @@
-# test
-
 streamlit
-pandas
+google-generativeai
 python-dotenv
+pandas
+pdfplumber
+python-docx
+gspread     # optional - only if you use Google Sheets persistence
+google-auth  # optional
